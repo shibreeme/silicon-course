@@ -1,0 +1,130 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>APB · 总线研习室</title><link rel="stylesheet" href="../style.css"></head><body><header><a class="brand" href="../index.html">▥ 总线研习室</a><nav><a href="../spi/lesson.html">← SPI</a><a href="../axi/lesson.html">下一课 AXI →</a></nav></header><main><section><small>片内互连　/　寄存器访问</small><h1>APB：让一次写入只生效一次</h1><p>目标是给软件提供一组可预测的寄存器。沿一条“写配置，再读回”的路径，先确定事务完成的时钟沿，再决定哪个 always_ff 可以修改状态。</p><nav><a href="#evolution">原理与演进</a><a href="#ports">端口连接</a><a href="#questions">概念自测</a><a href="#lab">RTL 实验</a></nav></section>
+<section id="evolution"><h2>为什么需要两个阶段？</h2><p>简单片上外设很少连续传输大块数据。APB 给地址译码留出一个明确的建立周期，之后才进入访问阶段。上游的处理器或 AXI 桥充当请求端，下游的定时器、UART 或加速器控制寄存器充当外设。两个端点共享 PCLK。</p><p>早期 APB 面向简单外设。APB3 引入 PREADY 和 PSLVERR，使外设能延长访问并报告失败；APB4 增加 PSTRB 字节选通和 PPROT 保护属性。下方实验采用 APB3 的 32 位整字访问约定。</p>
+<ol><li>建立阶段：请求端置 PSEL，令 PENABLE 为 0，提供地址和读写方向。若写入，此时给出数据。</li><li>访问阶段：下一拍置 PENABLE。外设可拉低 PREADY 插入等待；请求端保持地址、方向和写数据。</li><li>完成边沿：在 PSEL、PENABLE、PREADY 同为 1 的上升沿采样读数据和错误信号。下一笔即使访问同一外设，也要重新经历 PENABLE 为 0 的建立阶段。</li></ol><a href="../index.html#scope">在首页逐拍移动采样光标 →</a></section>
+<section id="ports"><h2>把请求端接到寄存器组</h2><pre>命令源 ── cmd_valid / cmd_ready ──► apb_requester
+                                      │ PSEL, PENABLE, PWRITE, PADDR, PWDATA
+                                      ▼
+                                  apb_registers
+                                      │ PREADY, PRDATA, PSLVERR
+                                      └────────► 请求端 ── done / error ──► 命令源</pre><table><thead><tr><th>信号与位宽</th><th>驱动端 → 采样端</th><th>连接和检查要点</th></tr></thead><tbody><tr><td>PCLK、PRESETn 各 1 位</td><td>系统 → 两个模块</td><td>代码名 clk、rst_n。共同上升沿，低有效复位。</td></tr><tr><td>PSEL、PENABLE、PWRITE 各 1 位</td><td>请求端 → 外设</td><td>多外设系统按地址译码产生每个外设的 PSEL。单独观察 PENABLE 无法确定谁被访问。</td></tr><tr><td>PADDR[7:0]、PWDATA[31:0]</td><td>请求端 → 外设</td><td>实验地址按字节编码。请求端先锁存命令，等待期间地址和写值保持稳定。</td></tr><tr><td>PREADY、PSLVERR、PRDATA[31:0]</td><td>外设 → 请求端</td><td>完成沿读取结果。扩展为多个外设时，按被选外设复用返回通路。</td></tr></tbody></table></section>
+<section id="questions"><h2>先回答，再核对波形</h2><details><summary>等待持续三拍，写计数器应加几次？</summary><p>成功完成时加一次。若用 PSEL &amp;&amp; PWRITE 作写使能，建立和等待阶段都会错误触发写入。</p></details><details><summary>请求端能看到 PREADY=1 就提前结束建立阶段吗？</summary><p>建立阶段固定占一拍。PREADY 只在双方进入访问阶段后参与完成判定。零等待传输也至少有建立和访问两个时钟周期。</p></details><details><summary>两笔写能共享一个连续为高的 PENABLE 吗？</summary><p>连续访问同一设备可让 PSEL 保持高，但两个访问阶段之间需要一个新的建立阶段。本实验请求端还回到 IDLE 接收下一条命令。</p></details><details><summary>写只读地址返回错误，原寄存器是否改变？</summary><p>本寄存器组约定失败写无副作用，测试会读回计数器验证。设计其他外设时须明确错误与副作用的契约。</p></details></section>
+<section id="lab"><h2>端到端实验：写入、等待、读回、拒绝</h2><p>0x00 是 32 位可读写寄存器，复位值为 0；0x04 是成功写入次数，只读。外设为每次传输插入一拍等待。向只读地址写入或访问未映射地址返回错误。命令输入侧的 valid/ready 握手与 APB 的两阶段操作分属不同接口。</p><p><a download href="apb.sv">下载请求端与寄存器 RTL</a>　<a download href="tb_apb.sv">下载自检测试台</a></p><pre>iverilog -g2012 -Wall -s tb_apb -o sim apb.sv tb_apb.sv
+vvp sim</pre><p>测试台先读复位值，再写 0xCAFE1234，随后尝试非法写和非法读，最后读回数据与写次数。每次请求被接收后立即改变命令端口，以验证请求端已锁存输入。通过条件是 6 次建立、6 个等待周期、6 次提交，且成功写次数为 1。</p><p>扩展练习：把等待长度变为可配置的 0 至 3 拍，再用相同的读写序列验证。此时提交次数不变，等待总数应随配置改变。进入 AXI 课程时，找出地址、数据和响应各自的提交边沿。</p><p>协议原文与代际背景见 <a href="https://developer.arm.com/documentation/ihi0024/latest/">Arm AMBA APB Protocol Specification</a> 和 <a href="https://developer.arm.com/additional-resources/video-tutorials/evolution-of-the-arm-amba-specifications">Arm AMBA 演进资料</a>。</p></section><section><h2>逐行阅读源码</h2><p>先读两端的接口声明，再展开测试台，沿模块实例上的连线回到每个信号的驱动端。</p><details><summary>apb.sv</summary><pre><code>module apb_requester(
+    input logic clk, rst_n, cmd_valid, cmd_write,
+    output logic cmd_ready, done, error,
+    input logic [7:0] cmd_addr,
+    input logic [31:0] cmd_data,
+    output logic [31:0] read_data,
+    output logic psel, penable, pwrite,
+    output logic [7:0] paddr,
+    output logic [31:0] pwdata,
+    input logic pready, pslverr,
+    input logic [31:0] prdata
+);
+    typedef enum logic [1:0] {IDLE, SETUP, ACCESS} state_t;
+    state_t state;
+    assign cmd_ready = rst_n &amp;&amp; state == IDLE;
+    assign psel = state != IDLE;
+    assign penable = state == ACCESS;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state &lt;= IDLE;
+            {done,error,pwrite,paddr,pwdata,read_data} &lt;= &#x27;0;
+        end else begin
+            done &lt;= 0;
+            case (state)
+                IDLE: if (cmd_valid) begin
+                    pwrite &lt;= cmd_write;
+                    paddr &lt;= cmd_addr;
+                    pwdata &lt;= cmd_data;
+                    state &lt;= SETUP;
+                end
+                SETUP: state &lt;= ACCESS;
+                ACCESS: if (pready) begin
+                    done &lt;= 1;
+                    error &lt;= pslverr;
+                    if (!pwrite) read_data &lt;= prdata;
+                    state &lt;= IDLE;
+                end
+                default: state &lt;= IDLE;
+            endcase
+        end
+    end
+endmodule
+
+module apb_registers(
+    input logic clk, rst_n, psel, penable, pwrite,
+    input logic [7:0] paddr,
+    input logic [31:0] pwdata,
+    output logic pready, pslverr,
+    output logic [31:0] prdata
+);
+    // Address 0 is scratch; address 4 is a read-only write counter.
+    logic [31:0] scratch, writes;
+    logic waiting;
+    assign pready = psel &amp;&amp; penable &amp;&amp; !waiting;
+    assign pslverr = pready &amp;&amp; !(paddr == 0 || (paddr == 4 &amp;&amp; !pwrite));
+    assign prdata = (paddr == 0) ? scratch : (paddr == 4) ? writes : 0;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            scratch &lt;= 0;
+            writes &lt;= 0;
+            waiting &lt;= 0;
+        end else begin
+            waiting &lt;= psel &amp;&amp; !penable;
+            if (pready &amp;&amp; pwrite &amp;&amp; !pslverr) begin
+                scratch &lt;= pwdata;
+                writes &lt;= writes + 1;
+            end
+        end
+    end
+endmodule
+</code></pre></details><details><summary>tb_apb.sv</summary><pre><code>module tb_apb;
+    bit clk;
+    always #5 clk = ~clk;
+    logic rst_n, cmd_valid, cmd_write, cmd_ready, done, error;
+    logic [7:0] cmd_addr, paddr;
+    logic [31:0] cmd_data, read_data, pwdata, prdata;
+    logic psel, penable, pwrite, pready, pslverr;
+    apb_requester u_req(.*);
+    apb_registers u_regs(.*);
+    int setups, stalls, transfers;
+    logic [40:0] snapshot;
+    always @(posedge clk) if (rst_n) begin
+        if (psel &amp;&amp; !penable) begin
+            setups++;
+            snapshot = {paddr,pwrite,pwdata};
+        end
+        if (penable) begin
+            if (!psel || {paddr,pwrite,pwdata} !== snapshot) $fatal(1,&quot;unstable access&quot;);
+            if (pready) transfers++; else stalls++;
+        end
+    end
+    task transact(input bit wr, input logic [7:0] addr,
+                  input logic [31:0] data, expected, input bit fault);
+        @(negedge clk);
+        if (!cmd_ready) $fatal(1,&quot;requester busy&quot;);
+        cmd_valid=1; cmd_addr=addr; cmd_write=wr; cmd_data=data;
+        @(negedge clk);
+        cmd_valid=0; cmd_data=~data; cmd_addr=~addr;
+        while (!done) @(negedge clk);
+        if (error !== fault || (!wr &amp;&amp; read_data !== expected))
+            $fatal(1,&quot;bad response addr=%h&quot;,addr);
+    endtask
+    initial begin
+        rst_n=0; cmd_valid=0;
+        repeat (2) @(negedge clk);
+        rst_n=1;
+        transact(0,0,0,0,0);
+        transact(1,0,32&#x27;hcafe1234,0,0);
+        transact(1,4,32&#x27;hdeadbeef,0,1);
+        transact(0,8,0,0,1);
+        transact(0,0,0,32&#x27;hcafe1234,0);
+        transact(0,4,0,1,0);
+        if (setups!=6 || stalls!=6 || transfers!=6) $fatal(1,&quot;phase counts&quot;);
+        $display(&quot;PASS APB: 6 transfers, 6 wait cycles, error and side effects checked&quot;);
+        $finish;
+    end
+    initial #2000 $fatal(1,&quot;timeout&quot;);
+endmodule
+</code></pre></details></section></main><footer><a href="../axi/lesson.html">下一课：沿五条 AXI 通道追踪一次读写 →</a></footer></body></html>

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AXI · 五条通道完成一次寄存器读写</title><link rel="stylesheet" href="../style.css"></head><body>
+<header><a class="brand" href="../index.html">← 总线学习站</a><nav><a href="#ports">端口连接</a><a href="#quiz">概念自测</a><a href="#lab">RTL 实验</a></nav></header>
+<main><section><small>04 / AXI</small><h1>把一次读写拆成五条通道</h1><p>以 CPU 给加速器配置寄存器为例。完成本课后，你能判断一拍数据何时移交，画出写数据先于写地址的合法时序，并用同一套主从 RTL 复现反压、字节写入和地址错误。</p></section>
+<section><h2>从外设配置到并行访存</h2><p>在 APB 中，一次访问依次经过设置和访问阶段。DMA 向内存连续搬运数据时，地址和返回数据各有自己的等待时间。AMBA 3 引入 AXI，把地址、数据与响应拆开，使下一笔请求有机会与前一笔的数据传输重叠。AMBA 4 体系包括 AXI4、AXI4-Lite 和 AXI4-Stream，可按端点需求选择。</p><table><tr><th>使用场景</th><th>接口与交易边界</th></tr><tr><td>CPU 写加速器配置</td><td>AXI4-Lite。每个地址对应一个数据拍，写完成由 B 响应确认。</td></tr><tr><td>DMA 从 DDR 读权重</td><td>AXI4 存储映射读。一条 AR 请求描述一个突发，最终数据拍携带 RLAST。</td></tr><tr><td>DMA 把权重交给计算核</td><td>AXI4-Stream。使用 TVALID、TREADY 和 TDATA，按应用约定用 TLAST 标出包尾。接口本身没有内存地址。</td></tr></table>
+<p>三者可在同一颗芯片中同时出现。把控制寄存器通过 AXI4-Lite 配好，由 DMA 负责在 AXI4 内存侧与 Stream 数据侧之间搬运。</p></section>
+<section id="ports"><h2>连接主端与寄存器外设</h2><p>下表的箭头表示载荷和 VALID 的方向。对应 READY 沿反方向连接；两端共用时钟与低有效复位。实验沿时钟上升沿同步采样复位，系统集成时需按时钟域设计复位释放。</p><pre>命令 start / 地址 / 数据 → lite_master ⇄ 五条通道 ⇄ lite_regs → value[31:0]
+结果 done / status / result ← 主端响应寄存器</pre>
+<table><tr><th>通道</th><th>方向与载荷</th><th>实验端口 VALID / READY</th><th>握手效果</th></tr><tr><td>AW 写地址</td><td>主 → 从，awaddr</td><td>av / ar</td><td>锁存字节地址</td></tr><tr><td>W 写数据</td><td>主 → 从，wdata、wstrb</td><td>wv / wr</td><td>锁存数据及每字节使能</td></tr><tr><td>B 写响应</td><td>从 → 主，bresp</td><td>bv / br</td><td>主端获知写结果</td></tr><tr><td>AR 读地址</td><td>主 → 从，araddr</td><td>arv / arr</td><td>从端采样待读地址</td></tr><tr><td>R 读数据</td><td>从 → 主，rdata、rresp</td><td>rv / rr</td><td>主端接收数据与状态</td></tr></table>
+<p>仅在上升沿同时采到 VALID 和 READY 才计一笔。源端有载荷时可主动置 VALID；一旦置位，必须保持 VALID 和载荷直到握手。目的端可提前置 READY 或在看到 VALID 后置位。让两个端点同时等待对方先断言会形成死锁。</p>
+<h3>一笔写入，四次观察</h3><ol><li>W 先完成握手。从端单独保存 WDATA 与 WSTRB，标记 have_w。</li><li>AW 若干拍后握手。从端保存地址，标记 have_a。地址与数据也允许同拍到达。</li><li>两个标记齐备后提交写入。地址 0 对应配置寄存器；每个有效 WSTRB 位覆盖一个字节。此时从端置 BVALID。</li><li>主端拉低 BREADY 时响应必须保持。B 通道握手后，主端发出 done，软件才可消费本笔写结果。</li></ol></section>
+<section><h2>从单拍扩展至 AXI4 突发</h2><p>AxLEN 编码拍数减一，AxSIZE 编码每拍传输字节数的以 2 为底的对数。以对齐的四拍 32 位 INCR 为例，起始地址 0x0FF0，AxLEN=3，AxSIZE=2，四个地址为 FF0、FF4、FF8、FFC。读的第四个握手携带 RLAST，写的第四个携带 WLAST。写突发只有一个 B 响应。</p><p>突发不能跨越 4 KiB 地址边界。若从 0x0FF8 搬相同 16 字节，分两次 INCR，每次两拍，起始分别为 0x0FF8 与 0x1000。事务 ID 用于匹配响应并约束顺序；不同 ID 的事务可在协议允许的顺序内重排。AXI4 的 W 通道没有 WID，写数据按写地址事务顺序传输。扩展实验时应给每个未完成事务保留其长度、ID 与返回状态。</p></section>
+<section id="quiz"><h2>先作答，再看解释</h2>
+<details><summary>AWVALID=1 持续三拍，AWREADY 仅最后一拍为 1，共接收几个地址？</summary><p>一个。前三拍之间必须保持地址；只在二者同为 1 的上升沿采样。</p></details>
+<details><summary>收到地址后从端就能拉高 BVALID 吗？</summary><p>AXI4-Lite 的写响应依赖地址与数据均已握手。只收到地址时尚无数据或字节掩码，不能确认写结果。</p></details>
+<details><summary>原值 0x11223344，写 0xAABBCCDD，WSTRB=0101，读回什么？</summary><p>0x11BB33DD。使能的是第 2 与第 0 字节。掩码最低位控制 WDATA[7:0]。</p></details>
+<details><summary>读数据到达后若 RREADY 为 0，外设可直接把 RDATA 连到正在变化的计数器吗？</summary><p>需要保存快照或用等效电路稳定输出。RVALID 已置位但未握手期间，RDATA 与 RRESP 必须保持。</p></details>
+<details><summary>AXI4 的 WLAST 和 Stream 的 TLAST 都表示一段结束，能直接互换吗？</summary><p>WLAST 标记对应写突发的最后一拍；TLAST 的包边界由流应用约定。DMA 可能拆分同一包为多个访存突发，二者的位置可不同。</p></details></section>
+<section id="lab"><h2>端到端实验 · 写掩码寄存器</h2><p>下载两份源码到同一目录。lite_master 在空闲时接受 start，高电平一个周期即可。lite_regs 暂存独立的 AW 与 W，读写响应分别注册。测试台在两端之间放置测试专用通道开关，按交易安排暂停各通道；开关是验证夹具，芯片集成时直接连接上述端口。</p>
+<p><a href="lite.sv" download>主端与外设 RTL ↓</a>　<a href="tb.sv" download>端到端自检测试台 ↓</a></p><pre>iverilog -g2012 -Wall -s tb -o sim lite.sv tb.sv
+vvp sim</pre>
+<p>实验实现 32 位单拍、一个未完成命令、地址 0 的配置寄存器；其余地址返回 SLVERR。保护属性未引入应用逻辑，连接标准接口时应在主端按系统访问属性驱动 AWPROT、ARPROT。完整 AXI4 的突发和 ID 是本课的架构扩展内容。</p>
+<table><tr><th>动作</th><th>核对点</th></tr><tr><td>复位读、全字节写、部分字节写</td><td>初值 0，最终值 11BB33DD</td></tr><tr><td>故意令 AW、W 轮流先到</td><td>提前握手的通道停止发送，另一通道持续等待，两个字段齐备前无响应</td></tr><tr><td>分别停顿 B、R</td><td>返回状态及读数据保持，主端尚未报告完成</td></tr><tr><td>访问 0x4 后重读 0</td><td>非法地址返回 2，合法寄存器不受错误写影响</td></tr></table>
+<p>练习：在地址 4 增加只读状态寄存器，保留非法写的错误响应。先扩充测试台的期望值，再改地址译码，最后重跑所有旧用例。</p></section>
+<section><h2>协议原文</h2><p>在 Arm IHI 0022 的 AXI4/AXI4-Lite 版本中查阅通道依赖、突发结构和顺序模型。流协议单独定义于 IHI 0051。</p><a href="https://developer.arm.com/documentation/ihi0022/h/">Arm AMBA AXI and ACE Protocol Specification</a> · <a href="https://developer.arm.com/documentation/ihi0051/latest/">Arm AMBA AXI-Stream Protocol Specification</a></section>
+<section><h2>进阶实验 · AXI4 的递增突发读</h2><p>把上一实验的一次寄存器读取扩展为一整个数据块。请求端在 AR 通道只提交一次起始字节地址、ARSIZE=2、ARBURST=INCR 和 ARLEN=拍数减一。响应端在每次 R 握手后将地址加 4，只在最后一拍置 RLAST。应用端的 take 可让传输随时停顿。</p><p>例如从 0x0FF0 读四拍，地址依次为 FF0、FF4、FF8、FFC；从 0x0FF4 读四拍则会跨越 4 KiB 页，命令须在发出 AR 前拒绝。本设计限定单一隐含 ID、单笔在途、对齐的 32 位 INCR 读。两端约定固定边带属性，实验不含突发写或乱序返回。</p><p><a download href="burst.sv">突发请求端和 ROM 响应端</a>　<a download href="tb_burst.sv">自检测试台</a></p><pre>iverilog -g2012 -Wall -s tb_burst -o sim burst.sv tb_burst.sv
+vvp sim</pre><p>验收包括 1、4、256 拍、逐拍反压、非对齐拒绝和 4 KiB 边界。思考：最后一拍 RVALID 已置位但 RREADY 为 0 时，为什么地址和 RLAST 都必须保持？因为还没有完成这笔数据交付。</p></section><section><h2>逐行阅读源码</h2><p>先读两端的接口声明，再展开测试台，沿模块实例上的连线回到每个信号的驱动端。</p><details><summary>burst.sv</summary><pre><code>module burst_reader(
+    input logic clk, rst_n, start,
+    input logic [31:0] base, input logic [7:0] len,
+    output logic busy, done, fault,
+    output logic [31:0] araddr, output logic [7:0] arlen,
+    output logic [2:0] arsize, output logic [1:0] arburst,
+    output logic arvalid, input logic arready,
+    input logic [31:0] rdata, input logic [1:0] rresp,
+    input logic rvalid, rlast, output logic rready,
+    input logic take, output logic valid, output logic [31:0] sample
+);
+    logic receiving;
+    logic [7:0] remaining;
+    // Exclusive byte end within the current 4 KiB page; 4096 is legal.
+    wire [12:0] end_offset = {1&#x27;b0,base[11:0]} + ({5&#x27;b0,len} + 13&#x27;d1) * 13&#x27;d4;
+    assign arsize=3&#x27;d2;
+    assign arburst=2&#x27;b01;
+    assign rready=receiving &amp;&amp; take;
+    assign valid=receiving &amp;&amp; rvalid;
+    assign sample=rdata;
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            {busy,done,fault,arvalid,receiving,araddr,arlen,remaining} &lt;= &#x27;0;
+        end else begin
+            done &lt;= 0;
+            if (!busy &amp;&amp; start) begin
+                fault &lt;= 0;
+                if (base[1:0]!=0 || end_offset&gt;4096) begin
+                    fault &lt;= 1;
+                    done &lt;= 1;
+                end else begin
+                    busy &lt;= 1;
+                    arvalid &lt;= 1;
+                    araddr &lt;= base;
+                    arlen &lt;= len;
+                    remaining &lt;= len;
+                end
+            end
+            if (arvalid &amp;&amp; arready) begin
+                arvalid &lt;= 0;
+                receiving &lt;= 1;
+            end
+            if (rvalid &amp;&amp; rready) begin
+                if (rresp!=0 || rlast!=(remaining==0)) fault &lt;= 1;
+                if (rlast) begin busy&lt;=0; receiving&lt;=0; done&lt;=1; end
+                else remaining &lt;= remaining-1&#x27;b1;
+            end
+        end
+    end
+endmodule
+
+// Paired responder for aligned 32-bit INCR requests. Single implicit ID.
+module burst_rom(
+    input logic clk, rst_n,
+    input logic [31:0] araddr, input logic [7:0] arlen,
+    input logic arvalid, output logic arready,
+    output logic [31:0] rdata, output logic [1:0] rresp,
+    output logic rvalid, rlast, input logic rready
+);
+    logic [31:0] address;
+    logic [7:0] remaining;
+    assign arready=rst_n &amp;&amp; !rvalid;
+    assign rresp=0;
+    assign rdata=address ^ 32&#x27;h5aa50000;
+    assign rlast=rvalid &amp;&amp; remaining==0;
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin rvalid&lt;=0; address&lt;=0; remaining&lt;=0; end
+        else if (arvalid &amp;&amp; arready) begin
+            address&lt;=araddr;
+            remaining&lt;=arlen;
+            rvalid&lt;=1;
+        end else if (rvalid &amp;&amp; rready) begin
+            if (rlast) rvalid&lt;=0;
+            else begin address&lt;=address+4; remaining&lt;=remaining-1&#x27;b1; end
+        end
+    end
+endmodule
+</code></pre></details><details><summary>lite.sv</summary><pre><code>module lite_master(input wire clk,rst_n,start,write_cmd,
+  input wire [31:0] addr,data, input wire [3:0] strobe,
+  output reg busy,done, output reg [31:0] result, output reg [1:0] status,
+  output reg av, wv, br, arv, rr, input wire ar,wr,bv,arr,rv,
+  output reg [31:0] awaddr,wdata,araddr, output reg [3:0] wstrb,
+  input wire [31:0] rdata,input wire [1:0] bresp,rresp);
+  always @(posedge clk) begin
+    if(!rst_n) begin
+      busy&lt;=0;done&lt;=0;av&lt;=0;wv&lt;=0;br&lt;=0;arv&lt;=0;rr&lt;=0;
+      result&lt;=0;status&lt;=0;awaddr&lt;=0;araddr&lt;=0;wdata&lt;=0;wstrb&lt;=0;
+    end else begin
+      done&lt;=0;
+      if(start &amp;&amp; !busy) begin
+        busy&lt;=1;
+        if(write_cmd) begin
+          av&lt;=1;wv&lt;=1;br&lt;=1;awaddr&lt;=addr;wdata&lt;=data;wstrb&lt;=strobe;
+        end else begin arv&lt;=1;rr&lt;=1;araddr&lt;=addr;end
+      end
+      if(av &amp;&amp; ar) av&lt;=0;
+      if(wv &amp;&amp; wr) wv&lt;=0;
+      if(arv &amp;&amp; arr) arv&lt;=0;
+      if(br &amp;&amp; bv) begin br&lt;=0;busy&lt;=0;done&lt;=1;status&lt;=bresp;end
+      if(rr &amp;&amp; rv) begin rr&lt;=0;busy&lt;=0;done&lt;=1;result&lt;=rdata;status&lt;=rresp;end
+    end
+  end
+endmodule
+
+module lite_regs(input wire clk,rst_n,input wire av,wv,br,arv,rr,
+  output wire ar,wr,arr,output reg bv,rv,
+  input wire [31:0] awaddr,wdata,araddr,input wire [3:0] wstrb,
+  output reg [31:0] rdata,output reg [1:0] bresp,rresp);
+  reg have_a,have_w; reg [31:0] a,d,value; reg [3:0] mask;
+  integer i;
+  assign ar=!have_a &amp;&amp; !bv;
+  assign wr=!have_w &amp;&amp; !bv;
+  assign arr=!rv;
+  always @(posedge clk) begin
+    if(!rst_n) begin
+      have_a&lt;=0;have_w&lt;=0;bv&lt;=0;rv&lt;=0;value&lt;=0;rdata&lt;=0;bresp&lt;=0;rresp&lt;=0;
+    end else begin
+      if(av &amp;&amp; ar) begin have_a&lt;=1;a&lt;=awaddr;end
+      if(wv &amp;&amp; wr) begin have_w&lt;=1;d&lt;=wdata;mask&lt;=wstrb;end
+      if(have_a &amp;&amp; have_w) begin
+        have_a&lt;=0;have_w&lt;=0;bv&lt;=1;bresp&lt;=(a==0)?0:2;
+        if(a==0) for(i=0;i&lt;4;i=i+1)
+          if(mask[i]) value[i*8+:8]&lt;=d[i*8+:8];
+      end
+      if(bv &amp;&amp; br) bv&lt;=0;
+      if(arv &amp;&amp; arr) begin rv&lt;=1;rresp&lt;=(araddr==0)?0:2;rdata&lt;=(araddr==0)?value:0;end
+      if(rv &amp;&amp; rr) rv&lt;=0;
+    end
+  end
+endmodule
+</code></pre></details><details><summary>tb.sv</summary><pre><code>module tb;
+  bit clk; always #5 clk=~clk;
+  bit rst_n,start,write_cmd;bit [31:0] addr,data;bit [3:0] strobe;
+  wire busy,done;wire [31:0] result;wire [1:0] status;
+  wire av,wv,br,arv,rr,ar,wr,bv,arr,rv;
+  wire [31:0] awaddr,wdata,araddr,rdata;wire [3:0] wstrb;wire [1:0] bresp,rresp;
+  bit ga,gw,gb,gr;wire sa,sw,sb,sr;
+  assign ar=sa &amp;&amp; ga; assign wr=sw &amp;&amp; gw;
+  assign bv=sb &amp;&amp; gb; assign rv=sr &amp;&amp; gr;
+  lite_master m(.*);
+  lite_regs s(.av(av &amp;&amp; ga),.wv(wv &amp;&amp; gw),.ar(sa),.wr(sw),.bv(sb),
+    .br(br &amp;&amp; gb),.rv(sr),.rr(rr &amp;&amp; gr),.*);
+  task tick; @(negedge clk); endtask
+  task command(input bit we,input [31:0] address,payload,input [3:0] mask);
+    write_cmd=we;addr=address;data=payload;strobe=mask;start=1;tick();start=0;
+  endtask
+  task testwrite(input bit addr_first,input [31:0] address,payload,input [3:0] mask,input [1:0] response);
+    ga=addr_first;gw=!addr_first;gb=0;
+    command(1,address,payload,mask);
+    repeat(3) tick();
+    if(av!==!addr_first || wv!==addr_first || sb!==0) $fatal(1,&quot;independence&quot;);
+    ga=1;gw=1;repeat(4) tick();
+    repeat(3) begin if(sb!==1 || bresp!==response || done!==0) $fatal(1,&quot;B stall&quot;);tick();end
+    gb=1;tick();if(done!==1 || status!==response) $fatal(1,&quot;B completion&quot;);
+  endtask
+  task testread(input [31:0] address,expected,input [1:0] response);
+    gr=0;command(0,address,0,0);tick();
+    repeat(3) begin if(sr!==1 || rdata!==expected || rresp!==response) $fatal(1,&quot;R stall&quot;);tick();end
+    gr=1;tick();if(done!==1 || result!==expected || status!==response) $fatal(1,&quot;R completion&quot;);
+  endtask
+  initial begin
+    tick();rst_n=1;testread(0,0,0);
+    testwrite(1,0,&#x27;h11223344,15,0); testwrite(0,0,&#x27;haabbccdd,5,0);
+    testread(0,&#x27;h11bb33dd,0);testwrite(0,4,0,15,2);testread(4,0,2);
+    testread(0,&#x27;h11bb33dd,0);$display(&quot;PASS AXI-Lite: split writes, stalls, strobes, errors&quot;);$finish;
+  end
+  initial #3000 $fatal(1,&quot;timeout&quot;);
+endmodule
+</code></pre></details><details><summary>tb_burst.sv</summary><pre><code>module tb_burst;
+    bit clk; always #5 clk=~clk;
+    logic rst_n,start,busy,done,fault,arvalid,arready,rvalid,rlast,rready,take,valid;
+    logic [31:0] base,araddr,rdata,sample;
+    logic [7:0] len, arlen;
+    logic [2:0] arsize;
+    logic [1:0] arburst,rresp;
+    burst_reader manager(.*);
+    burst_rom responder(.*);
+    integer addresses;
+    always @(posedge clk) if (rst_n &amp;&amp; arvalid &amp;&amp; arready) addresses++;
+    task check(input logic [31:0] origin,input integer count,input bit legal);
+        integer seen, before_count;
+        @(negedge clk); before_count=addresses;
+        start=1; base=origin; len=count-1; take=0;
+        @(negedge clk); start=0;
+        if (!legal) begin
+            if ({done,fault,busy,arvalid} !== 4&#x27;b1100) $fatal(1,&quot;bad request accepted&quot;);
+        end else begin
+            if ({arvalid,arburst,arsize} !== 6&#x27;b101010 || araddr !== origin || arlen !== len)
+                $fatal(1,&quot;address descriptor&quot;);
+            seen=0;
+            while (seen&lt;count) begin
+                while(!valid) @(negedge clk);
+                repeat(2) begin
+                    if (valid!==1 || sample!==((origin+4*seen)^32&#x27;h5aa50000) ||
+                        rlast!==(seen==count-1)) $fatal(1,&quot;data or last&quot;);
+                    @(negedge clk);
+                end
+                take=1; @(negedge clk); take=0; seen++;
+            end
+            if (!done || fault || addresses!=before_count+1) $fatal(1,&quot;completion&quot;);
+        end
+    endtask
+    initial begin
+        rst_n=0; start=0; take=0;
+        repeat(2) @(negedge clk); rst_n=1;
+        check(&#x27;h100,1,1); check(&#x27;hff0,4,1); check(&#x27;hff4,4,0);
+        check(&#x27;h002,1,0); check(&#x27;h4000,256,1);
+        $display(&quot;PASS AXI4 INCR read: 1/4/256 beats, stalls, alignment and 4KiB boundary&quot;);
+        $finish;
+    end
+    initial #20000 $fatal(1,&quot;timeout&quot;);
+endmodule
+</code></pre></details></section></main><footer><a href="../index.html">返回总线学习站</a></footer></body></html>

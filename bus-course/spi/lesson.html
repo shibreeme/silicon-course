@@ -1,0 +1,78 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SPI · 从采样沿到双向传输</title><link rel="stylesheet" href="../style.css"></head><body><header><a class="brand" href="../index.html">← 总线实验室</a><nav><a href="#principle">原理</a><a href="#wire">连线</a><a href="#questions">概念自测</a><a href="#rtl">RTL 实验</a></nav></header><main>
+<section id="principle"><small>SPI / SERIAL PERIPHERAL INTERFACE</small><h1>用八个时钟，交换两个字节</h1><p>设想一个控制器向外设发送 0x96，同时读回状态 0x53。先确定谁生成时钟，再约定首位何时有效，最后用波形证明两个字节各自准确到达。</p><h2>从移位寄存器到板级总线</h2><p>SPI 源于 Motorola 微控制器的同步外设互连。把两端移位寄存器首尾相接，每一次采样交换一位，八次就能双向传输两个字节。增加独立片选后，多个外设可共用时钟和数据线。现代串行闪存又发展出双线、四线数据阶段，增加引脚并行度的同时引入命令、地址、方向切换与等待周期。</p><p>经典四线 SPI 描述传输节拍。读取哪个寄存器、命令占几位、两字节之间能否释放片选，由具体器件手册规定。以 SAM D21 的 SERCOM 为工程对照，先核对时钟模式，再检查位序和实际 SCK 频率。<a href="https://ww1.microchip.com/downloads/aemDocuments/documents/MCU32/ProductDocuments/DataSheets/SAM-D21-DA1-Family-Data-Sheet-DS40001882.pdf">Microchip SAM D21 数据手册</a></p>
+<h3>先找空闲电平，再找采样沿</h3><p>CPOL 决定空闲时 SCK 的电平。将离开空闲电平的边沿称为第一沿，返回的边沿称为第二沿。CPHA 为 0 时第一沿采样，因此第一个数据位必须在第一沿到来前就稳定。</p><table><tr><th>模式</th><th>CPOL / CPHA</th><th>采样</th><th>准备下一位</th></tr><tr><td>0</td><td>0 / 0</td><td>上升沿</td><td>下降沿</td></tr><tr><td>1</td><td>0 / 1</td><td>下降沿</td><td>上升沿</td></tr><tr><td>2</td><td>1 / 0</td><td>下降沿</td><td>上升沿</td></tr><tr><td>3</td><td>1 / 1</td><td>上升沿</td><td>下降沿</td></tr></table><p><a href="https://onlinedocs.microchip.com/oxy/GUID-A9964E93-D46C-42E6-98D2-4ED783ABB2CE-en-US-2/GUID-0E901CC4-8D8D-458D-8FF5-8898F0C41259.html">Microchip SPI 模式定义</a></p></section>
+<section id="wire"><h2>从管脚连到模块</h2><pre>应用 ── start, tx ──▶ controller ── cs_n, sck, mosi ──▶ peripheral ◀── reply
+应用 ◀── done, rx ─── controller ◀──────── miso ─────── peripheral ──▶ received</pre><table><tr><th>信号</th><th>契约</th></tr><tr><td>clk / rst</td><td>控制端系统时钟与同步高有效复位。复位使 CS 回高、SCK 回低。</td></tr><tr><td>start / busy / done</td><td>空闲时接受 start 和 tx；发起方给一个时钟的脉冲。busy 期间忽略新请求。done 高一拍，此时 rx 可读。</td></tr><tr><td>cs_n / sck</td><td>控制端驱动。cs_n 低包围一帧；本例每个系统时钟切换一次 SCK，频率等于 clk 的一半。</td></tr><tr><td>mosi / miso</td><td>分别从控制端、外设送出。两端共地，未选中的外设释放 MISO。硅片顶层用输出使能控制 pad。</td></tr><tr><td>reply / received</td><td>外设回复字节须在片选前准备好并保持到帧结束。received 在第八个采样沿后完整；跨入另一时钟域时需要握手或异步 FIFO。</td></tr></table>
+<h3>手工解码模式 0</h3><pre>上升沿序号    1 2 3 4 5 6 7 8
+MOSI (0x96)   1 0 0 1 0 1 1 0
+MISO (0x53)   0 1 0 1 0 0 1 1</pre><p>片选拉低时预装 bit 7。随后每个下降沿准备下一位，两端在下一上升沿采样。最后一个下降沿让 SCK 回到空闲，控制器再释放片选。假设 clk 为 20 MHz，则八个 SCK 周期占 0.8 µs，完整帧还包含片选建立、保持与帧间空闲。</p></section>
+<section id="questions"><h2>概念自测</h2><details><summary>接收端要读数据，为什么控制端仍要发送字节？</summary><p>控制端必须生成时钟。发送填充字节可让外设移出返回值，填充值和等候拍数应按器件手册选择。</p></details><details><summary>两端都选上升沿采样，模式就一致吗？</summary><p>模式 0 和模式 3 都在上升沿采样，但空闲电平与起始相位不同。请先画出片选后第一个边沿，再检查首位的建立时间。</p></details><details><summary>八次采样都到了，仍然读回全 1，该检查哪里？</summary><p>先检查 CS 是否选对以及 MISO 驱动是否使能。未选中器件可能把返回线置于高阻；有上拉的板子会表现为全 1。再核对读命令、响应延迟和引脚复用。</p></details><details><summary>频率加倍后偶尔错一位，如何判断能否收敛？</summary><p>对于本例 MISO 半周期路径，将控制器时钟输出延迟、板级往返、外设输出延迟及接收器建立时间相加，比较半周期预算。实现时约束生成时钟和 I/O 时序，分别检查建立与保持时间。</p></details></section>
+<section id="rtl"><h2>端到端实验 · 双向字节交换</h2><p>下载两份文件放在同一目录。spi.sv 包含控制端与外设；tb_spi.sv 例化两个模块并连接四线。实验固定模式 0、8 位、MSB 优先、单外设、每帧一字节。测试台遍历全部 256 个发送值，各帧响应由发送值异或 0x5B 生成。</p><p><a href="spi.sv" download>下载控制器与外设 RTL</a>　<a href="tb_spi.sv" download>下载自检测试台</a></p><pre>iverilog -g2012 -Wall -s tb_spi -o spi_sim spi.sv tb_spi.sv
+vvp spi_sim</pre><p>验收输出为 <code>PASS: 256 full-duplex frames</code>。独立监视器在每个上升沿直接对照两个源字节，能发现两端同时写反位序的错误。帧结束时再检查边沿数、双端接收值、片选、时钟空闲和 MISO 高阻。</p><p>扩展练习：将设计改为连续两字节保持片选。先补测第八与第九上升沿之间的边界，再决定控制端怎样预取下一字节。若扩展到 ADC，加入工作频率、片选建立和保持时间的参数，并用所选器件的数据手册推导参数下限。</p></section><section><h2>逐行阅读源码</h2><p>先读两端的接口声明，再展开测试台，沿模块实例上的连线回到每个信号的驱动端。</p><details><summary>spi.sv</summary><pre><code>// Mode 0, eight bits, MSB first. One byte per asserted CS.
+module spi_controller(input logic clk, rst, start, input logic [7:0] tx,
+    input logic miso, output logic sck, cs_n, mosi, busy, done, output logic [7:0] rx);
+    logic [7:0] transmit, receive;
+    logic [2:0] index;
+    logic finish_frame;
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            sck &lt;= 0; cs_n &lt;= 1; busy &lt;= 0; done &lt;= 0;
+            mosi &lt;= 0; rx &lt;= 0; finish_frame &lt;= 0;
+        end else begin
+            done &lt;= 0;
+            if (!busy &amp;&amp; start) begin
+                transmit &lt;= tx; receive &lt;= 0; index &lt;= 7; mosi &lt;= tx[7];
+                cs_n &lt;= 0; busy &lt;= 1;
+            end else if (busy &amp;&amp; finish_frame) begin
+                cs_n &lt;= 1; busy &lt;= 0; done &lt;= 1; rx &lt;= receive; finish_frame &lt;= 0;
+            end else if (busy &amp;&amp; !sck) begin
+                sck &lt;= 1; receive &lt;= {receive[6:0],miso};
+            end else if (busy) begin
+                sck &lt;= 0;
+                if (index == 0) finish_frame &lt;= 1;
+                else begin index &lt;= index-1&#x27;b1; mosi &lt;= transmit[index-1&#x27;b1]; end
+            end
+        end
+    end
+endmodule
+
+// Keep reply stable from before CS assertion until CS deassertion.
+module spi_peripheral(input logic sck, cs_n, mosi, input logic [7:0] reply,
+    output wire miso, output logic [7:0] received);
+    logic [2:0] index;
+    always_ff @(negedge sck or posedge cs_n)
+        if (cs_n) index &lt;= 7;
+        else index &lt;= index-1&#x27;b1;
+    assign miso = cs_n ? 1&#x27;bz : reply[index];
+    always_ff @(posedge sck)
+        if (!cs_n) received &lt;= {received[6:0],mosi};
+endmodule
+</code></pre></details><details><summary>tb_spi.sv</summary><pre><code>module tb_spi;
+    bit clk;
+    always #5 clk = ~clk;
+    logic rst=1,start=0;
+    logic [7:0] tx,reply;
+    wire [7:0] rx,received;
+    wire miso,mosi,sck,cs_n,busy,done;
+    spi_controller controller(.*);
+    spi_peripheral peripheral(.*);
+    integer edges;
+    always @(posedge sck) if (!cs_n) begin
+        if (mosi !== tx[7-edges] || miso !== reply[7-edges]) $fatal(1,&quot;wire order&quot;);
+        edges = edges+1;
+    end
+    initial begin
+        repeat(2) @(negedge clk);
+        rst=0;
+        for(integer n=0;n&lt;256;n=n+1) begin
+            tx=n; reply=8&#x27;h5b ^ n; edges=0; start=1;
+            @(negedge clk); start=0;
+            wait(done); @(negedge clk);
+            if(edges!=8 || rx!==reply || received!==tx || sck!==0 ||
+               cs_n!==1 || miso!==1&#x27;bz || busy!==0) $fatal(1,&quot;frame mismatch&quot;);
+        end
+        $display(&quot;PASS: 256 full-duplex frames&quot;); $finish;
+    end
+    initial #60000 $fatal(1,&quot;timeout&quot;);
+endmodule
+</code></pre></details></section></main><footer><a href="../apb/lesson.html">下一章 · APB 寄存器访问 →</a></footer></body></html>

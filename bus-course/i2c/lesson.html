@@ -1,0 +1,101 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>I²C · 从开漏引脚到应答周期</title><link rel="stylesheet" href="../style.css"><header><a href="../index.html">← 总线研习室</a></header><main><article><p>板级互连 / I²C</p><h1>两根线，多个目标</h1><p>在地址为 0x48 的目标上写入 0xA5。跟踪同一笔事务，从上拉电阻的作用一路读到接收寄存器的更新沿。</p>
+<section><h2>01　发展与原理</h2><p>Philips 在 1982 年发布 I²C，为同一块板上的控制芯片和低速外设提供双线接口。共享数据线减少引脚，地址字段选择设备。标准模式上限 100 kbit/s，快速模式 400 kbit/s，Fm+ 达 1 Mbit/s。提速时要重新检查线上电容、上升时间和器件灌电流能力。</p><p>在常规开漏模式，发送 0 时驱动器拉低线路，发送 1 时释放。上拉电阻给总线电容充电才使电平升高。多个驱动器中任意一个拉低，所有输入都读到 0。用逻辑分析仪检查边沿时序，用示波器检查上升时间。</p><p><a href="https://www.nxp.com/docs/en/user-guide/UM10204.pdf">NXP UM10204 Rev. 7 · 见 §3 协议与 §7 电气设计</a></p></section>
+<section><h2>02　端口与连接</h2><pre>          VDD        VDD
+           │Rp        │Rp
+控制器 ─── SCL ────────┼───── 目标时钟输入
+控制器 ────────────── SDA ─── 目标数据输入与开漏输出
+                  共地</pre><table><thead><tr><th>模块端口</th><th>连接与时序约定</th></tr></thead><tbody><tr><td>writer.start / address / data</td><td>空闲时给一拍 start，同时提交七位地址与八位数据，内部锁存。</td></tr><tr><td>scl_low / sda_low</td><td>高表示拉低焊盘，低表示高阻。sda 输入必须回读实际引脚。</td></tr><tr><td>clk / rst / tick</td><td>clk 为系统时钟，rst 同步高有效。tick 每次推进一个相位。测试台每 16 拍发一次 tick。</td></tr><tr><td>sink.scl / sda / sda_low</td><td>目标过采样两条线，检测起止与时钟边沿，只在应答时拉低 SDA。</td></tr><tr><td>done / nack / written / value</td><td>控制器在 STOP 后报告完成和结果。目标以 written 脉冲标记 value 更新。</td></tr></tbody></table><p>RTL 核心暴露输入与拉低使能；测试台用 tri1 模拟上拉，用两个独立高阻驱动连接 SDA。FPGA 顶层将其接到双向 I/O 缓冲，ASIC 顶层接到工艺 I/O 单元。</p></section>
+<section><h2>03　逐位拆解一次写事务</h2><pre>START │ 1001000 0 │ 0 │ 10100101 │ 0 │ STOP
+         地址   写   ACK    数据     ACK</pre><p>空闲时两线高。SCL 高时 SDA 由高变低构成 START。控制器在 SCL 低电平准备下一位，高电平保持稳定；最高位先发。地址 0x48 左移并补写方向位得到线上首字节 0x90。第九个时钟由控制器提供，但数据线由控制器释放，目标可拉低确认。</p><p>控制器采样 ACK 后继续发送 0xA5。目标在第八个上升沿拼出完整字节，在应答尾部提交。最后控制器先令 SDA 保持低，释放 SCL，再释放 SDA，形成 STOP。若首字节收到 NACK，本实验直接发 STOP。</p></section>
+<section><h2>04　先判断，再对照答案</h2><details><summary>一次成功的单字节写有多少个数据与应答时钟？</summary><p>两个八位字节各附一次 ACK，共 18 个。START、STOP 按 SDA 在 SCL 高时的变化识别。分析仪按帧解码时要将起止边沿与数据位区分开。</p></details><details><summary>地址值写成 0x90，为什么设备可能不响应？</summary><p>核的接口收七位地址；0x90 已包含方向位，传入该数会被截断并再次拼接方向。先明确软件接口接受七位地址还是线上首字节。</p></details><details><summary>读寄存器时为什么会遇到重复 START 和末字节 NACK？</summary><p>典型顺序是写方向送寄存器指针、重复 START、读方向重新寻址，再由目标发送数据。控制器接收最后一个字节后用 NACK 通知发送方结束，然后发 STOP。具体指针语义取决于器件手册。</p></details><details><summary>怎样将这个写核扩展到时钟拉伸和多控制器？</summary><p>释放 SCL 后回读实际线电平，确认高电平后再采样。多控制器发送高位时还须检查 SDA，若读回低则退出仲裁；设计中还需总线空闲检测、超时恢复与协议时序验证。</p></details></section>
+<section><h2>05　端到端 RTL 与自检</h2><p>实现范围为单控制器、七位寻址、每事务写一个字节。两端按系统时钟运行。这里用理想上拉和过采样，未建模 RC 波形、毛刺滤波或真实器件最小脉宽。教学核不实现读、多控制器仲裁、时钟拉伸。</p><p><a href="i2c.sv" download>下载控制器与目标 RTL</a>　<a href="tb.sv" download>下载端到端测试台</a></p><pre>iverilog -g2012 -Wall -s tb -o sim i2c.sv tb.sv
+vvp sim</pre><p>验收包括成功写 0xA5、0x00、0xFF，错误地址产生 NACK，错误事务不触发目标提交，每次正确事务恰好提交一次，并在结束后释放双线。预期输出 <code>PASS: I2C three writes and address NACK</code>。先看 writer 的 LOW、SETUP、HIGH、SAMPLE 四个状态，再看 sink 如何用 count=8 和 9 控制应答窗口。</p><p>扩展练习：增加一个可配置的目标地址，向两个目标交替写入不同数据。验收时分别统计 written 次数，并确认未被选中的目标在第九个时钟释放 SDA。</p></section></article><footer><a href="../index.html">返回学习路线</a></footer><section><h2>逐行阅读源码</h2><p>先读两端的接口声明，再展开测试台，沿模块实例上的连线回到每个信号的驱动端。</p><details><summary>i2c.sv</summary><pre><code>module i2c_writer(input wire clk, rst, tick, start,
+ input wire [6:0] address, input wire [7:0] data, input wire sda,
+ output reg scl_low, sda_low, busy, done, nack);
+ localparam IDLE=0, START=1, LOW=2, SETUP=3, HIGH=4, SAMPLE=5, STOP0=6, STOP1=7, STOP2=8, STOP3=9;
+ reg [3:0] state, bit_no;
+ reg [7:0] tx, payload;
+ reg data_phase;
+ always @(posedge clk) begin
+   if(rst) begin state&lt;=IDLE; busy&lt;=0; done&lt;=0; nack&lt;=0; scl_low&lt;=0; sda_low&lt;=0; end
+   else begin
+     done&lt;=0;
+     if(state==IDLE &amp;&amp; start) begin
+       tx&lt;={address,1&#x27;b0}; payload&lt;=data; bit_no&lt;=0; data_phase&lt;=0;
+       state&lt;=START; busy&lt;=1; nack&lt;=0;
+     end else if(tick) case(state)
+       START: begin sda_low&lt;=1; state&lt;=LOW; end
+       LOW: begin scl_low&lt;=1; state&lt;=SETUP; end
+       SETUP: begin sda_low &lt;= bit_no==8 ? 0 : !tx[7]; state&lt;=HIGH; end
+       HIGH: begin scl_low&lt;=0; state&lt;=SAMPLE; end
+       SAMPLE: begin
+         state&lt;=LOW;
+         if(bit_no&lt;8) begin tx&lt;=tx&lt;&lt;1; bit_no&lt;=bit_no+1&#x27;b1; end
+         else if(sda || data_phase) begin nack&lt;=sda; state&lt;=STOP0; end
+         else begin tx&lt;=payload; bit_no&lt;=0; data_phase&lt;=1; end
+       end
+       STOP0: begin scl_low&lt;=1; state&lt;=STOP1; end
+       STOP1: begin sda_low&lt;=1; state&lt;=STOP2; end
+       STOP2: begin scl_low&lt;=0; state&lt;=STOP3; end
+       STOP3: begin sda_low&lt;=0; busy&lt;=0; done&lt;=1; state&lt;=IDLE; end
+       default: ;
+     endcase
+   end
+ end
+endmodule
+
+module i2c_sink #(parameter [6:0] ADDRESS=7&#x27;h48)
+ (input wire clk,rst,scl,sda, output reg sda_low, written, output reg [7:0] value);
+ reg [2:0] cs, ds;
+ reg [7:0] shift;
+ reg [3:0] count;
+ reg active, selected, payload;
+ wire rise=cs[1] &amp;&amp; !cs[2], fall=!cs[1] &amp;&amp; cs[2];
+ always @(posedge clk) begin
+   if(rst) begin cs&lt;=7; ds&lt;=7; active&lt;=0; written&lt;=0; value&lt;=0; sda_low&lt;=0;
+     count&lt;=0; selected&lt;=0; payload&lt;=0; shift&lt;=0; end
+   else begin
+     cs&lt;={cs[1:0],scl}; ds&lt;={ds[1:0],sda}; written&lt;=0;
+     if(cs[1] &amp;&amp; ds[2] &amp;&amp; !ds[1]) begin active&lt;=1; count&lt;=0; payload&lt;=0; selected&lt;=0; sda_low&lt;=0; end
+     else if(cs[1] &amp;&amp; !ds[2] &amp;&amp; ds[1]) begin active&lt;=0; sda_low&lt;=0; end
+     else if(active) begin
+       if(rise &amp;&amp; count&lt;8) begin
+         shift&lt;={shift[6:0],ds[1]}; count&lt;=count+1&#x27;b1;
+         if(count==7 &amp;&amp; !payload) selected&lt;=({shift[6:0],ds[1]}=={ADDRESS,1&#x27;b0});
+       end else if(fall &amp;&amp; count==8) begin sda_low&lt;=selected; count&lt;=9; end
+       else if(fall &amp;&amp; count==9) begin
+         sda_low&lt;=0; count&lt;=0;
+         if(payload &amp;&amp; selected) begin value&lt;=shift; written&lt;=1; end
+         active&lt;=selected &amp;&amp; !payload; payload&lt;=1;
+       end
+     end
+   end
+ end
+endmodule
+</code></pre></details><details><summary>tb.sv</summary><pre><code>module tb;
+ bit clk=0; always #5 clk=!clk;
+ bit rst=1,start=0; reg [6:0] addr; reg [7:0] data;
+ reg [3:0] divider=0; always @(posedge clk) divider&lt;=divider+1&#x27;b1;
+ wire scl_low,md,sd,busy,done,nack,written;wire [7:0] value;
+ tri1 scl,sda;
+ assign scl=scl_low?1&#x27;b0:1&#x27;bz;
+ assign sda=md?1&#x27;b0:1&#x27;bz;
+ assign sda=sd?1&#x27;b0:1&#x27;bz;
+ i2c_writer writer(clk,rst,&amp;divider,start,addr,data,sda,scl_low,md,busy,done,nack);
+ i2c_sink sink(clk,rst,scl,sda,sd,written,value);
+ integer writes=0;
+ always @(posedge clk) if(written) writes&lt;=writes+1;
+ task send(input [6:0] a,input [7:0] d,input bit reject);
+ integer before_count;
+ begin
+   before_count=writes; @(negedge clk);addr=a;data=d;start=1;
+   @(negedge clk);start=0;wait(done);@(negedge clk);
+   if(nack!==reject || writes!=before_count+!reject || (!reject &amp;&amp; value!==d) || sda!==1 || scl!==1)
+     $fatal(1,&quot;write %h %h&quot;,a,d);
+ end endtask
+ initial begin repeat(5) @(negedge clk);rst=0;
+ send(&#x27;h48,&#x27;ha5,0);send(&#x27;h49,&#x27;h12,1);send(&#x27;h48,&#x27;h00,0);send(&#x27;h48,&#x27;hff,0);
+ $display(&quot;PASS: I2C three writes and address NACK&quot;);$finish; end
+ initial #1000000 $fatal(1,&quot;timeout&quot;);
+endmodule
+</code></pre></details></section></main></html>
